@@ -15,21 +15,24 @@ const {
 
 const ffmpeg = require('ffmpeg-static');
 const sodium = require('libsodium-wrappers');
+const { chromium } = require('playwright-chromium');
 
 // ─── ENV ──────────────────────────────────────────────────────────────────────
-const { DISCORD_TOKEN, VOICE_CHANNEL_ID, SC_PLAYLIST_URL, SC_CLIENT_ID } = process.env;
-if (!DISCORD_TOKEN || !VOICE_CHANNEL_ID || !SC_PLAYLIST_URL || !SC_CLIENT_ID) {
-  console.error('❌ Missing env: DISCORD_TOKEN, VOICE_CHANNEL_ID, SC_PLAYLIST_URL, SC_CLIENT_ID');
+const { DISCORD_TOKEN, VOICE_CHANNEL_ID, SC_PLAYLIST_URL } = process.env;
+if (!DISCORD_TOKEN || !VOICE_CHANNEL_ID || !SC_PLAYLIST_URL) {
+  console.error('❌ Missing env: DISCORD_TOKEN, VOICE_CHANNEL_ID, SC_PLAYLIST_URL');
   process.exit(1);
 }
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 const SELF_DEAFEN = true;
-const OPUS_BITRATE = '96k';
+const OPUS_BITRATE = '96k'; // Use '64k' to cut bandwidth ~35–45%
 const HTTP_HEADERS = [
   'User-Agent: Mozilla/5.0 (DiscordRadio/1.0)',
   'Accept: */*',
 ];
+const RESOLVE_TIMEOUT_MS = 15000; // time budget to sniff a playable URL on each track
+const CACHE_TTL_MS = 30 * 60 * 1000; // cache stream URLs for 30 minutes
 
 // ─── DISCORD CLIENT ──────────────────────────────────────────────────────────
 const client = new Client({
@@ -44,7 +47,7 @@ let connection = null;
 let trackUrls = [];
 let idx = 0;
 
-// ─── SCRAPE TRACKS ───────────────────────────────────────────────────────────
+// ─── SCRAPE TRACKS (HTML → permalink URLs) ───────────────────────────────────
 async function scrapePlaylistTracks(url) {
   const res = await fetch(url, { redirect: 'follow' });
   if (!res.ok) throw new Error(`HTTP ${res.status} loading playlist page`);
@@ -55,57 +58,116 @@ async function scrapePlaylistTracks(url) {
   for (const m of html.matchAll(regex)) {
     raw.push(m[1].replace(/\\u002F/g, '/'));
   }
+  // keep only track URLs (exclude /sets/)
   const tracks = raw.filter(u =>
     /^https:\/\/soundcloud\.com\/[^/]+\/[^/]+$/.test(u) && !u.includes('/sets/')
   );
   return [...new Set(tracks)];
 }
 
-// ─── API HELPERS ─────────────────────────────────────────────────────────────
-async function scResolve(url) {
-  const api = `https://api-v2.soundcloud.com/resolve?url=${encodeURIComponent(url)}&client_id=${encodeURIComponent(SC_CLIENT_ID)}`;
-  const r = await fetch(api, { redirect: 'follow' });
-  if (!r.ok) throw new Error(`Resolve failed: HTTP ${r.status}`);
-  return await r.json();
+// ─── PLAYWRIGHT (headless Chromium) ───────────────────────────────────────────
+let browser, page;
+async function ensureBrowser() {
+  if (browser && page) return;
+  browser = await chromium.launch({
+    headless: true,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--no-zygote',
+      '--disable-dev-shm-usage',
+      '--disable-background-networking',
+      '--disable-background-timer-throttling',
+      '--disable-renderer-backgrounding',
+      '--mute-audio'
+    ]
+  });
+  const context = await browser.newContext({
+    userAgent: 'Mozilla/5.0 (DiscordRadio/1.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36',
+    viewport: { width: 1200, height: 800 },
+  });
+  page = await context.newPage();
+
+  // Save bandwidth: block images/fonts/ads
+  await page.route('**/*', route => {
+    const r = route.request();
+    const type = r.resourceType();
+    if (type === 'image' || type === 'font' || type === 'stylesheet') return route.abort();
+    return route.continue();
+  });
 }
 
-async function scMedia(trackId) {
-  const api = `https://api-v2.soundcloud.com/media/soundcloud:tracks:${trackId}?client_id=${encodeURIComponent(SC_CLIENT_ID)}`;
-  const r = await fetch(api, { redirect: 'follow' });
-  if (!r.ok) throw new Error(`Media failed: HTTP ${r.status}`);
-  return await r.json();
+// Cache resolved stream URLs (m3u8/mp3) per track page
+const urlCache = new Map(); // key: trackPageUrl, val: { url, ts }
+
+async function resolvePlayableUrl(trackPageUrl) {
+  const cache = urlCache.get(trackPageUrl);
+  if (cache && (Date.now() - cache.ts) < CACHE_TTL_MS) return cache.url;
+
+  await ensureBrowser();
+
+  let foundUrl = null;
+  const candidates = [];
+
+  const onResponse = async (response) => {
+    try {
+      const u = response.url();
+      if (!u) return;
+      // Heuristics: sniff real audio playlist or progressive mp3
+      if (/\.(m3u8)(\?.*)?$/i.test(u) || /\.mp3(\?.*)?$/i.test(u)) {
+        candidates.push(u);
+      } else {
+        // Some CDNs hide behind query strings; check content-type
+        const ct = response.headers()['content-type'] || '';
+        if (ct.includes('application/vnd.apple.mpegurl') || ct.includes('audio/mpeg')) {
+          candidates.push(u);
+        }
+      }
+    } catch {}
+  };
+
+  page.on('response', onResponse);
+
+  // Navigate and wait a bit while the player initializes network requests
+  await page.goto(trackPageUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+
+  // Kick the player: click the big play button if present
+  try {
+    // Generic selector used in SC track pages
+    const playBtn = page.locator('button[title="Play"]');
+    if (await playBtn.count()) {
+      await playBtn.first().click({ timeout: 3000 }).catch(() => {});
+    }
+  } catch {}
+
+  await page.waitForTimeout(RESOLVE_TIMEOUT_MS);
+
+  page.off('response', onResponse);
+
+  // Pick best candidate: prefer .m3u8 then .mp3
+  foundUrl = candidates.find(u => /\.m3u8/i.test(u)) || candidates.find(u => /\.mp3/i.test(u)) || null;
+
+  if (!foundUrl) throw new Error('No playable URL sniffed from page');
+
+  urlCache.set(trackPageUrl, { url: foundUrl, ts: Date.now() });
+  return foundUrl;
 }
 
-async function getStreamUrlForTrack(trackPageUrl) {
-  const resolved = await scResolve(trackPageUrl);
-  const id = resolved?.id || resolved?.track?.id;
-  if (!id) throw new Error('No track id from resolve');
-
-  const media = await scMedia(id);
-  const trans = media?.transcodings || [];
-  let pick = trans.find(t => t.format?.protocol === 'progressive')
-          || trans.find(t => t.format?.protocol === 'hls');
-  if (!pick) throw new Error('No usable transcoding');
-
-  const sig = pick.url.includes('?') ? `${pick.url}&client_id=${SC_CLIENT_ID}` : `${pick.url}?client_id=${SC_CLIENT_ID}`;
-  const sr = await fetch(sig, { redirect: 'follow' });
-  if (!sr.ok) throw new Error(`Signature fetch failed: HTTP ${sr.status}`);
-  const data = await sr.json();
-  if (!data?.url) throw new Error('No stream URL in signature response');
-  return { url: data.url, hls: pick.format?.protocol === 'hls' };
-}
-
-// ─── FFMPEG PIPE ─────────────────────────────────────────────────────────────
+// ─── FFMPEG PIPE: URL (HLS/MP3) → Opus (OGG) ─────────────────────────────────
 function ffmpegToOggOpus(inputUrl) {
   const args = [
     '-hide_banner',
     '-loglevel', 'warning',
+    // robust network
     '-reconnect', '1',
     '-reconnect_streamed', '1',
     '-reconnect_delay_max', '5',
+    // headers (some hosts care)
     '-headers', HTTP_HEADERS.join('\r\n'),
+    // input
     '-i', inputUrl,
     '-vn',
+    // Discord-friendly audio
     '-ac', '2',
     '-ar', '48000',
     '-c:a', 'libopus',
@@ -113,7 +175,6 @@ function ffmpegToOggOpus(inputUrl) {
     '-f', 'ogg',
     'pipe:1'
   ];
-
   const child = spawn(ffmpeg, args, { stdio: ['ignore', 'pipe', 'pipe'] });
   child.stderr.on('data', d => {
     const line = d.toString().trim();
@@ -122,31 +183,38 @@ function ffmpegToOggOpus(inputUrl) {
   return child.stdout;
 }
 
-// ─── PLAYBACK LOOP ───────────────────────────────────────────────────────────
+// ─── PLAYBACK LOOP ────────────────────────────────────────────────────────────
 async function playCurrent() {
+  if (!trackUrls.length) {
+    console.log('No tracks yet; retrying in 30s…');
+    setTimeout(loopPlay, 30000);
+    return;
+  }
+
   const pageUrl = trackUrls[idx % trackUrls.length];
-  console.log(`▶️  Playing: ${pageUrl}`);
+  console.log(`▶️  Resolving & Playing: ${pageUrl}`);
 
   try {
-    const { url: streamUrl } = await getStreamUrlForTrack(pageUrl);
-    const ogg = ffmpegToOggOpus(streamUrl);
+    const streamUrl = await resolvePlayableUrl(pageUrl);
 
+    // Watchdog: ensure bytes start flowing
+    const ogg = ffmpegToOggOpus(streamUrl);
     let got = false;
     const watchdog = setTimeout(() => {
       if (!got) {
-        console.warn('No audio from ffmpeg in 8s — skipping');
+        console.warn('No audio bytes from ffmpeg in 8s — skipping…');
         try { ogg.destroy(); } catch {}
         idx = (idx + 1) % trackUrls.length;
         setTimeout(loopPlay, 1500);
       }
     }, 8000);
-    ogg.once('data', () => { got = true; clearTimeout(watchdog); console.log('Audio started ✅'); });
+    ogg.once('data', () => { got = true; clearTimeout(watchdog); console.log('Audio stream started.'); });
 
     const resource = createAudioResource(ogg, { inputType: StreamType.OggOpus });
     player.play(resource);
   } catch (err) {
     console.error('Playback error:', err?.message || err);
-    idx = (idx + 1) % trackUrls.length;
+    idx = (idx + 1) % trackUrls.length; // skip failed
     setTimeout(loopPlay, 2000);
   }
 }
@@ -194,12 +262,14 @@ async function main() {
   loopPlay();
 }
 
-process.on('SIGTERM', () => {
+process.on('SIGTERM', async () => {
+  try { await page?.close(); await browser?.close(); } catch {}
   try { connection?.destroy(); } catch {}
   process.exit(0);
 });
 
-main().catch(err => {
+main().catch(async (err) => {
   console.error('Fatal boot error:', err?.message || err);
+  try { await page?.close(); await browser?.close(); } catch {}
   process.exit(1);
 });
