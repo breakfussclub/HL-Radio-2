@@ -62,12 +62,12 @@ function loadPlaylist(dir) {
 
 // ===== Status Cleaner =====
 function setListeningStatus(trackName) {
-  let clean = trackName.replace(/\.[^/.]+$/, "");    // remove extension
-  clean = clean.replace(/^\d+\s*/, "");              // remove leading number
-  clean = clean.replace(/-of$/i, "");                // remove -of at end
-  clean = clean.replace(/[-_]/g, " ");               // replace symbols with space
+  let clean = trackName.replace(/\.[^/.]+$/, "");      // remove extension
+  clean = clean.replace(/^\d+\s*/, "");                // remove leading number
+  clean = clean.replace(/-of$/i, "");                  // remove -of at end
+  clean = clean.replace(/[-_]/g, " ");                 // replace symbols with space
   clean = clean.replace(/\b\w/g, c => c.toUpperCase()); // capitalize words
-  client.user.setActivity(clean, { type: 2 });       // type 2 = LISTENING
+  client.user.setActivity(clean, { type: 2 });         // type 2 = LISTENING
 }
 
 // ===== Discord Bot Setup =====
@@ -82,6 +82,7 @@ let connection = null;
 const player = createAudioPlayer();
 let playlist = [];
 let indexPtr = 0;
+let hasStartedPlayback = false;
 
 // ===== Playback =====
 function playNext() {
@@ -134,31 +135,47 @@ async function connectAndSubscribe(channelId) {
   connection.subscribe(player);
 }
 
-// ===== Auto Pause / Resume =====
+// ===== Auto Pause / Resume + Wait for First Listener =====
 client.on("voiceStateUpdate", (oldState, newState) => {
   const channel = oldState.channel || newState.channel;
   if (!channel || channel.id !== VOICE_CHANNEL_ID) return;
 
   const humanMembers = channel.members.filter(m => !m.user.bot);
 
+  // If empty, pause ONLY if currently playing
   if (humanMembers.size === 0) {
-    if (!player.pause()) console.log("[VC] Nothing to pause (already paused?)");
-    else console.log("[VC] No listeners — pausing playback.");
-  } else {
-    if (player.state.status === AudioPlayerStatus.Paused) {
-      player.unpause();
-      console.log("[VC] Listener joined — resuming playback.");
+    if (player.state.status === AudioPlayerStatus.Playing) {
+      player.pause();
+      console.log("[VC] No listeners — pausing playback.");
     }
+    return;
+  }
+
+  // If someone joined and we haven't started yet, start playback
+  if (!hasStartedPlayback) {
+    hasStartedPlayback = true;
+    console.log("[VC] First listener joined — starting playback.");
+    playNext();
+    return;
+  }
+
+  // If paused, resume playback
+  if (player.state.status === AudioPlayerStatus.Paused) {
+    player.unpause();
+    console.log("[VC] Listener joined — resuming playback.");
   }
 });
 
 // ===== Event Hooks =====
-player.on(AudioPlayerStatus.Idle, () => playNext());
+player.on(AudioPlayerStatus.Idle, () => {
+  if (hasStartedPlayback) playNext();
+});
 player.on("error", err => {
   console.error("[PLAYER ERROR]", err);
-  playNext();
+  if (hasStartedPlayback) playNext();
 });
 
+// ===== On Ready =====
 client.once(Events.ClientReady, async () => {
   console.log(`[READY] Logged in as ${client.user.tag}`);
 
@@ -167,7 +184,7 @@ client.once(Events.ClientReady, async () => {
   playlist.forEach((p, i) => console.log(`  ${String(i + 1).padStart(2)}. ${path.basename(p)}`));
 
   await connectAndSubscribe(VOICE_CHANNEL_ID);
-  playNext();
+  console.log("[VC] Waiting for listeners...");
 });
 
 // ===== Start Bot =====
