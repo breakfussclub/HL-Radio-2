@@ -14,6 +14,7 @@ const play = require('play-dl');
 const { spawn } = require('node:child_process');
 const ffmpeg = require('ffmpeg-static');
 const sodium = require('libsodium-wrappers');
+const fetch = require('node-fetch');
 
 // ─── Env ──────────────────────────────────────────────────────────────────────
 const { DISCORD_TOKEN, VOICE_CHANNEL_ID, SC_PLAYLIST_URL } = process.env;
@@ -24,7 +25,7 @@ if (!DISCORD_TOKEN || !VOICE_CHANNEL_ID || !SC_PLAYLIST_URL) {
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 const SELF_DEAFEN = true;
-const BITRATE = '96k'; // could be '64k' to reduce bandwidth
+const BITRATE = '96k';
 
 // ─── Discord Client ───────────────────────────────────────────────────────────
 const client = new Client({
@@ -38,6 +39,15 @@ const player = createAudioPlayer({
 let playlist = [];
 let index = 0;
 let connection = null;
+
+// ─── Step 1: Extract Track URLs from SoundCloud HTML ─────────────────────────
+async function scrapePlaylistTracks(url) {
+  const page = await (await fetch(url)).text();
+  const regex = /"permalink_url":"(https:\/\/soundcloud\.com\/[^"]+)"/g;
+  const matches = [...page.matchAll(regex)].map(m => m[1].replace(/\\u002F/g, '/'));
+  const unique = [...new Set(matches)];
+  return unique;
+}
 
 // ─── FFmpeg Helper ────────────────────────────────────────────────────────────
 function ffmpegOggOpus(input) {
@@ -53,26 +63,23 @@ function ffmpegOggOpus(input) {
     '-f', 'ogg',
     'pipe:1'
   ];
-
   const child = spawn(ffmpeg, args, { stdio: ['pipe', 'pipe', 'pipe'] });
   input.on('error', e => console.error('Input stream error:', e?.message || e));
   input.pipe(child.stdin);
-
   child.stderr.on('data', d => {
     const line = d.toString().trim();
     if (line) console.log('[ffmpeg]', line);
   });
-
   return child.stdout;
 }
 
-// ─── Playback ─────────────────────────────────────────────────────────────────
+// ─── Playback Loop ────────────────────────────────────────────────────────────
 async function playTrack() {
-  const track = playlist[index % playlist.length];
-  console.log(`▶️  Now Playing: ${track.title}`);
+  const url = playlist[index % playlist.length];
+  console.log(`▶️  Now Playing: ${url}`);
 
   try {
-    const source = await play.stream(track.url, { discordPlayerCompatibility: false });
+    const source = await play.stream(url, { discordPlayerCompatibility: false });
     const oggOut = ffmpegOggOpus(source.stream);
     const resource = createAudioResource(oggOut, { inputType: StreamType.OggOpus });
     player.play(resource);
@@ -119,9 +126,9 @@ async function main() {
   await client.login(DISCORD_TOKEN);
   console.log(`✅ Logged in as ${client.user.tag}`);
 
-  const scInfo = await play.playlist_info(SC_PLAYLIST_URL, { incomplete: true });
-  playlist = scInfo.all_tracks().map(t => ({ title: t.name, url: t.url }));
+  playlist = await scrapePlaylistTracks(SC_PLAYLIST_URL);
   console.log(`Playlist loaded (${playlist.length} tracks)`);
+  if (!playlist.length) throw new Error('Playlist has 0 tracks after scrape.');
 
   await ensureConnection();
   loopPlay();
