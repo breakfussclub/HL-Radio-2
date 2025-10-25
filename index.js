@@ -45,7 +45,7 @@ function loadPlaylist(dir) {
     )
     .map(f => ({ name: f, number: parseLeadingNumber(f) }));
 
-  if (files.length === 0) {
+  if (!files.length) {
     throw new Error("No supported audio files (.ogg | .mp3 | .wav) in repo root.");
   }
 
@@ -60,6 +60,16 @@ function loadPlaylist(dir) {
   return files.map(f => path.join(dir, f.name));
 }
 
+// ===== Status Cleaner =====
+function setListeningStatus(trackName) {
+  let clean = trackName.replace(/\.[^/.]+$/, "");    // remove extension
+  clean = clean.replace(/^\d+\s*/, "");              // remove leading number
+  clean = clean.replace(/-of$/i, "");                // remove -of at end
+  clean = clean.replace(/[-_]/g, " ");               // replace symbols with space
+  clean = clean.replace(/\b\w/g, c => c.toUpperCase()); // capitalize words
+  client.user.setActivity(clean, { type: 2 });       // type 2 = LISTENING
+}
+
 // ===== Discord Bot Setup =====
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
@@ -70,24 +80,31 @@ const player = createAudioPlayer();
 let playlist = [];
 let indexPtr = 0;
 
+// ===== Playback =====
 function playNext() {
   const filePath = playlist[indexPtr];
+  const baseName = path.basename(filePath);
+
   try {
     const resource = createAudioResource(filePath, {
       inputType: StreamType.Arbitrary
     });
+
     player.play(resource);
-    console.log(`[PLAY] ${path.basename(filePath)} (${indexPtr + 1}/${playlist.length})`);
+    setListeningStatus(baseName);
+    console.log(`[PLAY] ${baseName} (${indexPtr + 1}/${playlist.length})`);
   } catch (err) {
-    console.error(`[ERROR] Failed to play ${filePath}:`, err);
+    console.error(`[ERROR] Failed to play ${baseName}:`, err);
   }
+
   indexPtr = (indexPtr + 1) % playlist.length;
 }
 
+// ===== Voice Connection =====
 async function connectAndSubscribe(channelId) {
   const channel = await client.channels.fetch(channelId);
   if (!channel || channel.type !== 2) {
-    throw new Error("VOICE_CHANNEL_ID must point to a Voice Channel.");
+    throw new Error("VOICE_CHANNEL_ID must refer to a Voice Channel.");
   }
 
   connection = joinVoiceChannel({
@@ -114,6 +131,7 @@ async function connectAndSubscribe(channelId) {
   connection.subscribe(player);
 }
 
+// ===== Event Hooks =====
 player.on(AudioPlayerStatus.Idle, () => playNext());
 player.on("error", err => {
   console.error("[PLAYER ERROR]", err);
@@ -122,11 +140,14 @@ player.on("error", err => {
 
 client.once(Events.ClientReady, async () => {
   console.log(`[READY] Logged in as ${client.user.tag}`);
+
   playlist = loadPlaylist(__dirname);
   console.log("[PLAYLIST]");
   playlist.forEach((p, i) => console.log(`  ${String(i + 1).padStart(2)}. ${path.basename(p)}`));
+
   await connectAndSubscribe(VOICE_CHANNEL_ID);
   playNext();
 });
 
+// ===== Start Bot =====
 client.login(DISCORD_TOKEN);
