@@ -46,7 +46,7 @@ function loadPlaylist(dir) {
     .map(f => ({ name: f, number: parseLeadingNumber(f) }));
 
   if (files.length === 0) {
-    throw new Error("No supported audio files (.ogg | .mp3 | .wav) in root.");
+    throw new Error("No supported audio files (.ogg | .mp3 | .wav) in repo root.");
   }
 
   files.sort((a, b) => {
@@ -74,7 +74,7 @@ function playNext() {
   const filePath = playlist[indexPtr];
   try {
     const resource = createAudioResource(filePath, {
-      inputType: StreamType.Arbitrary,
+      inputType: StreamType.Arbitrary
     });
     player.play(resource);
     console.log(`[PLAY] ${path.basename(filePath)} (${indexPtr + 1}/${playlist.length})`);
