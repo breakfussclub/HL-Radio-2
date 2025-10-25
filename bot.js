@@ -14,20 +14,19 @@ const play = require('play-dl');
 const { spawn } = require('node:child_process');
 const ffmpeg = require('ffmpeg-static');
 const sodium = require('libsodium-wrappers');
-const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
 
-// ─── Env ──────────────────────────────────────────────────────────────────────
+// ─── ENV ──────────────────────────────────────────────────────────────────────
 const { DISCORD_TOKEN, VOICE_CHANNEL_ID, SC_PLAYLIST_URL } = process.env;
 if (!DISCORD_TOKEN || !VOICE_CHANNEL_ID || !SC_PLAYLIST_URL) {
-  console.error('Missing env. Set DISCORD_TOKEN, VOICE_CHANNEL_ID, SC_PLAYLIST_URL');
+  console.error('❌ Missing env values. Set DISCORD_TOKEN, VOICE_CHANNEL_ID, SC_PLAYLIST_URL');
   process.exit(1);
 }
 
-// ─── Config ───────────────────────────────────────────────────────────────────
+// ─── CONFIG ───────────────────────────────────────────────────────────────────
 const SELF_DEAFEN = true;
 const BITRATE = '96k';
 
-// ─── Discord Client ───────────────────────────────────────────────────────────
+// ─── DISCORD CLIENT ──────────────────────────────────────────────────────────
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates]
 });
@@ -40,16 +39,7 @@ let playlist = [];
 let index = 0;
 let connection = null;
 
-// ─── Step 1: Extract Track URLs from SoundCloud HTML ─────────────────────────
-async function scrapePlaylistTracks(url) {
-  const page = await (await fetch(url)).text();
-  const regex = /"permalink_url":"(https:\/\/soundcloud\.com\/[^"]+)"/g;
-  const matches = [...page.matchAll(regex)].map(m => m[1].replace(/\\u002F/g, '/'));
-  const unique = [...new Set(matches)];
-  return unique;
-}
-
-// ─── FFmpeg Helper ────────────────────────────────────────────────────────────
+// ─── FFmpeg Helper ───────────────────────────────────────────────────────────
 function ffmpegOggOpus(input) {
   const args = [
     '-hide_banner',
@@ -63,8 +53,8 @@ function ffmpegOggOpus(input) {
     '-f', 'ogg',
     'pipe:1'
   ];
+
   const child = spawn(ffmpeg, args, { stdio: ['pipe', 'pipe', 'pipe'] });
-  input.on('error', e => console.error('Input stream error:', e?.message || e));
   input.pipe(child.stdin);
   child.stderr.on('data', d => {
     const line = d.toString().trim();
@@ -73,18 +63,18 @@ function ffmpegOggOpus(input) {
   return child.stdout;
 }
 
-// ─── Playback Loop ────────────────────────────────────────────────────────────
+// ─── PLAYBACK LOOP ───────────────────────────────────────────────────────────
 async function playTrack() {
-  const url = playlist[index % playlist.length];
-  console.log(`▶️  Now Playing: ${url}`);
+  const track = playlist[index % playlist.length];
+  console.log(`▶️  Now Playing: ${track.name}`);
 
   try {
-    const source = await play.stream(url, { discordPlayerCompatibility: false });
+    const source = await play.stream(track.url);
     const oggOut = ffmpegOggOpus(source.stream);
     const resource = createAudioResource(oggOut, { inputType: StreamType.OggOpus });
     player.play(resource);
   } catch (err) {
-    console.error('Playback error:', err?.message || err);
+    console.error('Playback error:', err);
     index++;
     setTimeout(loopPlay, 2000);
   }
@@ -92,7 +82,7 @@ async function playTrack() {
 
 function loopPlay() {
   playTrack().catch(err => {
-    console.error('Loop error:', err?.message || err);
+    console.error('Loop error:', err);
     setTimeout(loopPlay, 5000);
   });
 }
@@ -103,12 +93,12 @@ player.on(AudioPlayerStatus.Idle, () => {
 });
 
 player.on('error', err => {
-  console.error('AudioPlayer error:', err?.message || err);
+  console.error('AudioPlayer error:', err);
   index++;
   setTimeout(loopPlay, 2000);
 });
 
-// ─── Voice Connection ─────────────────────────────────────────────────────────
+// ─── VOICE CONNECTION ────────────────────────────────────────────────────────
 async function ensureConnection() {
   const channel = await client.channels.fetch(VOICE_CHANNEL_ID);
   connection = joinVoiceChannel({
@@ -120,15 +110,19 @@ async function ensureConnection() {
   connection.subscribe(player);
 }
 
-// ─── Boot ─────────────────────────────────────────────────────────────────────
+// ─── BOOT ────────────────────────────────────────────────────────────────────
 async function main() {
   await sodium.ready;
   await client.login(DISCORD_TOKEN);
   console.log(`✅ Logged in as ${client.user.tag}`);
 
-  playlist = await scrapePlaylistTracks(SC_PLAYLIST_URL);
-  console.log(`Playlist loaded (${playlist.length} tracks)`);
-  if (!playlist.length) throw new Error('Playlist has 0 tracks after scrape.');
+  // AUTH STEP — THIS IS THE FIX
+  const clientID = await play.getFreeClientID();
+  play.setToken({ soundcloud: { client_id: clientID }});
+
+  const pl = await play.playlist_info(SC_PLAYLIST_URL, { incomplete: true });
+  playlist = pl.all_tracks();
+  console.log(`✅ Playlist loaded: ${playlist.length} tracks`);
 
   await ensureConnection();
   loopPlay();
