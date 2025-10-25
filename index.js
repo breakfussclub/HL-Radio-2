@@ -72,7 +72,10 @@ function setListeningStatus(trackName) {
 
 // ===== Discord Bot Setup =====
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildVoiceStates
+  ],
 });
 
 let connection = null;
@@ -130,6 +133,24 @@ async function connectAndSubscribe(channelId) {
 
   connection.subscribe(player);
 }
+
+// ===== Auto Pause / Resume =====
+client.on("voiceStateUpdate", (oldState, newState) => {
+  const channel = oldState.channel || newState.channel;
+  if (!channel || channel.id !== VOICE_CHANNEL_ID) return;
+
+  const humanMembers = channel.members.filter(m => !m.user.bot);
+
+  if (humanMembers.size === 0) {
+    if (!player.pause()) console.log("[VC] Nothing to pause (already paused?)");
+    else console.log("[VC] No listeners — pausing playback.");
+  } else {
+    if (player.state.status === AudioPlayerStatus.Paused) {
+      player.unpause();
+      console.log("[VC] Listener joined — resuming playback.");
+    }
+  }
+});
 
 // ===== Event Hooks =====
 player.on(AudioPlayerStatus.Idle, () => playNext());
