@@ -1,7 +1,7 @@
 {
   "name": "discord-soundcloud-radio",
   "version": "1.0.0",
-  "description": "24/7 Discord bot that downloads a SoundCloud playlist (Node-only) and plays it on loop",
+  "description": "24/7 Discord bot that streams a SoundCloud playlist via client_id (no Python)",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js"
@@ -15,7 +15,6 @@
     "dotenv": "^16.4.5",
     "ffmpeg-static": "^5.2.0",
     "libsodium-wrappers": "^0.7.13",
-    "prism-media": "^1.3.5",
-    "scdl-core": "^1.0.0"
+    "prism-media": "^1.3.5"
   }
 }
