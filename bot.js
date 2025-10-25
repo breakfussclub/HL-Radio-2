@@ -1,8 +1,5 @@
 require('dotenv').config();
-const fs = require('fs');
-const fsp = require('fs/promises');
-const path = require('path');
-const { spawn } = require('child_process');
+const { spawn } = require('node:child_process');
 
 const { Client, GatewayIntentBits } = require('discord.js');
 const {
@@ -16,37 +13,25 @@ const {
   StreamType
 } = require('@discordjs/voice');
 
-const ffmpegPath = require('ffmpeg-static');
-// Try to load scdl-core in the most common ways:
-let scdl;
-try {
-  // some builds export default, some commonjs
-  const mod = require('scdl-core');
-  scdl = mod.default || mod;
-} catch (e) {
-  console.error('❌ Unable to load scdl-core:', e?.message || e);
-  process.exit(1);
-}
-
+const ffmpeg = require('ffmpeg-static');
 const sodium = require('libsodium-wrappers');
 
 // ─── ENV ──────────────────────────────────────────────────────────────────────
-const { DISCORD_TOKEN, VOICE_CHANNEL_ID, SC_PLAYLIST_URL } = process.env;
-if (!DISCORD_TOKEN || !VOICE_CHANNEL_ID || !SC_PLAYLIST_URL) {
-  console.error('❌ Missing env values. Set DISCORD_TOKEN, VOICE_CHANNEL_ID, SC_PLAYLIST_URL');
+const { DISCORD_TOKEN, VOICE_CHANNEL_ID, SC_PLAYLIST_URL, SC_CLIENT_ID } = process.env;
+if (!DISCORD_TOKEN || !VOICE_CHANNEL_ID || !SC_PLAYLIST_URL || !SC_CLIENT_ID) {
+  console.error('❌ Missing env: DISCORD_TOKEN, VOICE_CHANNEL_ID, SC_PLAYLIST_URL, SC_CLIENT_ID');
   process.exit(1);
 }
 
-// Optional: if you have your own SC client_id, set it to improve reliability
-const { SC_CLIENT_ID } = process.env;
-
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
-const TRACK_DIR = path.join(__dirname, 'tracks');
 const SELF_DEAFEN = true;
-const OPUS_BITRATE = '96k';     // Discord transmit bitrate (Opus)
-const MP3_QUALITY = '128k';     // Downloaded MP3 quality (target)
+const OPUS_BITRATE = '96k'; // set '64k' to reduce data
+const HTTP_HEADERS = [
+  'User-Agent: Mozilla/5.0 (DiscordRadio/1.0)',
+  'Accept: */*',
+];
 
-// ─── DISCORD ──────────────────────────────────────────────────────────────────
+// ─── DISCORD CLIENT ──────────────────────────────────────────────────────────
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates]
 });
@@ -56,26 +41,81 @@ const player = createAudioPlayer({
 });
 
 let connection = null;
-let playlistFiles = [];
-let playIndex = 0;
+let trackUrls = []; // SoundCloud track page URLs (permalink_url)
+let idx = 0;
 
-// ─── HELPERS ──────────────────────────────────────────────────────────────────
-async function ensureDir(dir) {
-  if (!fs.existsSync(dir)) await fsp.mkdir(dir, { recursive: true });
+// ─── SCRAPE PLAYLIST (HTML → track permalink URLs) ───────────────────────────
+async function scrapePlaylistTracks(url) {
+  const res = await fetch(url, { redirect: 'follow' });
+  if (!res.ok) throw new Error(`HTTP ${res.status} loading playlist page`);
+  const html = await res.text();
+
+  // Extract permalink_url from embedded JSON; SoundCloud escapes / as \u002F
+  const regex = /"permalink_url":"(https:\/\/soundcloud\.com\/[^"]+)"/g;
+  const raw = [];
+  for (const m of html.matchAll(regex)) {
+    raw.push(m[1].replace(/\\u002F/g, '/'));
+  }
+  // keep only track URLs (exclude /sets/)
+  const tracks = raw.filter(u =>
+    /^https:\/\/soundcloud\.com\/[^/]+\/[^/]+$/.test(u) && !u.includes('/sets/')
+  );
+  // de-dupe preserving order
+  return [...new Set(tracks)];
 }
 
-function sanitize(name) {
-  return name
-    .replace(/[\\/:*?"<>|]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+// ─── SOUNDCloud API helpers (client_id-based) ─────────────────────────────────
+// 1) Resolve track URL → track object (contains id)
+async function scResolve(url) {
+  const api = `https://api-v2.soundcloud.com/resolve?url=${encodeURIComponent(url)}&client_id=${encodeURIComponent(SC_CLIENT_ID)}`;
+  const r = await fetch(api, { redirect: 'follow' });
+  if (!r.ok) throw new Error(`Resolve failed: HTTP ${r.status}`);
+  return await r.json();
 }
 
-function ffmpegFileToOggOpus(filePath) {
+// 2) Get media transcodings for track id → choose progressive or hls
+async function scMedia(trackId) {
+  const api = `https://api-v2.soundcloud.com/media/soundcloud:tracks:${trackId}?client_id=${encodeURIComponent(SC_CLIENT_ID)}`;
+  const r = await fetch(api, { redirect: 'follow' });
+  if (!r.ok) throw new Error(`Media failed: HTTP ${r.status}`);
+  return await r.json();
+}
+
+// 3) Get actual stream URL from a transcoding (progressive preferred, else hls)
+async function getStreamUrlForTrack(trackPageUrl) {
+  const resolved = await scResolve(trackPageUrl);
+  const id = resolved && (resolved.id || resolved.track?.id);
+  if (!id) throw new Error('No track id from resolve');
+
+  const media = await scMedia(id);
+  const trans = media?.transcodings || [];
+
+  // Prefer progressive mp3; else hls
+  let pick = trans.find(t => t.format?.protocol === 'progressive')
+          || trans.find(t => t.format?.protocol === 'hls');
+  if (!pick) throw new Error('No usable transcoding (progressive/hls)');
+
+  // Get signed stream URL
+  const sig = pick.url.includes('?') ? `${pick.url}&client_id=${SC_CLIENT_ID}` : `${pick.url}?client_id=${SC_CLIENT_ID}`;
+  const sr = await fetch(sig, { redirect: 'follow' });
+  if (!sr.ok) throw new Error(`Signature fetch failed: HTTP ${sr.status}`);
+  const data = await sr.json();
+  if (!data || !data.url) throw new Error('No stream URL in signature response');
+  return { url: data.url, hls: pick.format?.protocol === 'hls' };
+}
+
+// ─── FFmpeg: input URL (mp3 or HLS) → OGG/Opus pipe ──────────────────────────
+function ffmpegToOggOpus(inputUrl) {
   const args = [
     '-hide_banner',
     '-loglevel', 'warning',
-    '-i', filePath,
+    // network robustness + headers
+    '-reconnect', '1',
+    '-reconnect_streamed', '1',
+    '-reconnect_delay_max', '5',
+    // pass UA to some CDNs
+    '-headers', HTTP_HEADERS.join('\r\n'),
+    '-i', inputUrl,
     '-vn',
     '-ac', '2',
     '-ar', '48000',
@@ -84,7 +124,8 @@ function ffmpegFileToOggOpus(filePath) {
     '-f', 'ogg',
     'pipe:1'
   ];
-  const child = spawn(ffmpegPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+
+  const child = spawn(ffmpeg, args, { stdio: ['ignore', 'pipe', 'pipe'] });
   child.stderr.on('data', d => {
     const line = d.toString().trim();
     if (line) console.log('[ffmpeg]', line);
@@ -92,134 +133,65 @@ function ffmpegFileToOggOpus(filePath) {
   return child.stdout;
 }
 
-async function listMp3sOrdered() {
-  const files = await fsp.readdir(TRACK_DIR);
-  return files
-    .filter(f => f.toLowerCase().endsWith('.mp3'))
-    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
-    .map(f => path.join(TRACK_DIR, f));
-}
-
-// ─── PLAYLIST SCRAPE (HTML) — one pass (7–8 tracks) ──────────────────────────
-async function scrapePlaylistTracks(url) {
-  const res = await fetch(url, { redirect: 'follow' });
-  if (!res.ok) throw new Error(`HTTP ${res.status} loading playlist page`);
-  const html = await res.text();
-
-  // Extract track permalink URLs from the bootstrapped state (SoundCloud escapes / as \u002F)
-  const regex = /"permalink_url":"(https:\/\/soundcloud\.com\/[^"]+)"/g;
-  const urls = [];
-  for (const m of html.matchAll(regex)) {
-    const u = m[1].replace(/\\u002F/g, '/');
-    urls.push(u);
+// ─── PLAYBACK LOOP ────────────────────────────────────────────────────────────
+async function playCurrent() {
+  if (!trackUrls.length) {
+    console.log('No tracks yet; retrying in 30s…');
+    setTimeout(loopPlay, 30_000);
+    return;
   }
 
-  // Keep only track URLs (exclude /sets/, /likes, etc.)
-  const trackUrls = urls.filter(u =>
-    /^https:\/\/soundcloud\.com\/[^/]+\/[^/]+$/.test(u) && !u.includes('/sets/')
-  );
+  const pageUrl = trackUrls[idx % trackUrls.length];
+  console.log(`▶️  Resolving & Playing: ${pageUrl}`);
 
-  // De-duplicate while preserving order
-  const unique = [...new Set(trackUrls)];
-  if (!unique.length) throw new Error('No track URLs found in playlist HTML');
-
-  return unique;
-}
-
-// ─── DOWNLOAD ONE TRACK (with multiple fallbacks) ─────────────────────────────
-async function downloadTrackToFile(trackUrl, indexForName) {
-  // We'll try common scdl-core APIs in order. Many variants return a Readable stream.
-  const targetBase = `${String(indexForName).padStart(2, '0')}`;
-  let titleGuess = `track-${targetBase}`;
-  let outFile;
-
-  // Try to resolve metadata (to get a nice filename)
   try {
-    if (typeof scdl.getInfo === 'function') {
-      const info = await scdl.getInfo(trackUrl, { client_id: SC_CLIENT_ID });
-      if (info?.title) titleGuess = sanitize(info.title);
-    } else if (typeof scdl.info === 'function') {
-      const info = await scdl.info(trackUrl, { client_id: SC_CLIENT_ID });
-      if (info?.title) titleGuess = sanitize(info.title);
-    }
-  } catch {
-    // If info fails, we’ll still download using generic name
+    const { url: streamUrl } = await getStreamUrlForTrack(pageUrl);
+
+    // Watchdog: confirm ffmpeg outputs bytes or skip
+    const ogg = ffmpegToOggOpus(streamUrl);
+    let got = false;
+    const watchdog = setTimeout(() => {
+      if (!got) {
+        console.warn('No audio bytes from ffmpeg in 8s — skipping…');
+        try { ogg.destroy(); } catch {}
+        idx = (idx + 1) % trackUrls.length;
+        setTimeout(loopPlay, 1500);
+      }
+    }, 8000);
+    ogg.once('data', () => { got = true; clearTimeout(watchdog); console.log('Audio stream started.'); });
+
+    const resource = createAudioResource(ogg, { inputType: StreamType.OggOpus });
+    player.play(resource);
+  } catch (err) {
+    console.error('Playback error:', err?.message || err);
+    idx = (idx + 1) % trackUrls.length; // Option A: skip failed
+    setTimeout(loopPlay, 2000);
   }
+}
 
-  outFile = path.join(TRACK_DIR, `${targetBase}-${titleGuess}.mp3`);
-  if (fs.existsSync(outFile)) {
-    console.log(`✔ Skipping (exists): ${path.basename(outFile)}`);
-    return outFile;
-  }
-
-  // Try a few download shapes
-  const tryShapes = [
-    // scdl-core often exposes .download(url, {format:'mp3'|quality})
-    async () => (typeof scdl.download === 'function'
-      ? await scdl.download(trackUrl, { client_id: SC_CLIENT_ID, format: 'mp3', quality: MP3_QUALITY })
-      : null),
-    // Some variants: .downloadTrack / .downloadSong
-    async () => (typeof scdl.downloadTrack === 'function'
-      ? await scdl.downloadTrack(trackUrl, { client_id: SC_CLIENT_ID, quality: 'mp3' })
-      : null),
-    async () => (typeof scdl.downloadSong === 'function'
-      ? await scdl.downloadSong(trackUrl, { client_id: SC_CLIENT_ID, quality: 'mp3' })
-      : null)
-  ];
-
-  let stream = null;
-  for (const fn of tryShapes) {
-    try {
-      const s = await fn();
-      if (s && typeof s.pipe === 'function') { stream = s; break; }
-    } catch (e) {
-      // try next shape
-    }
-  }
-
-  if (!stream) {
-    console.warn(`⚠ Could not download via scdl-core methods: ${trackUrl}`);
-    return null;
-  }
-
-  console.log(`⬇️  Downloading: ${path.basename(outFile)}`);
-  await new Promise((resolve, reject) => {
-    const ws = fs.createWriteStream(outFile);
-    stream.on('error', reject);
-    ws.on('error', reject);
-    ws.on('finish', resolve);
-    stream.pipe(ws);
+function loopPlay() {
+  playCurrent().catch(err => {
+    console.error('Loop error:', err?.message || err);
+    setTimeout(loopPlay, 5000);
   });
-
-  return outFile;
 }
 
-// ─── DOWNLOAD PLAYLIST (A1 mode: only missing files) ─────────────────────────
-async function downloadPlaylist() {
-  console.log('⬇️  Resolving playlist (HTML scrape)…');
-  await ensureDir(TRACK_DIR);
-  const urls = await scrapePlaylistTracks(SC_PLAYLIST_URL);
+player.on(AudioPlayerStatus.Idle, () => {
+  idx = (idx + 1) % trackUrls.length;
+  setTimeout(loopPlay, 1500);
+});
 
-  console.log(`Found ${urls.length} track URLs. Downloading missing MP3s…`);
-  for (let i = 0; i < urls.length; i++) {
-    const saved = await downloadTrackToFile(urls[i], i + 1).catch(e => {
-      console.error('Download error:', e?.message || e);
-      return null;
-    });
-    if (!saved) console.warn(`⚠ Skipped: ${urls[i]}`);
-  }
-
-  playlistFiles = await listMp3sOrdered();
-  if (!playlistFiles.length) throw new Error('No MP3 files found after download.');
-  console.log(`✅ Playlist ready: ${playlistFiles.length} files in ${TRACK_DIR}`);
-}
+player.on('error', err => {
+  console.error('AudioPlayer error:', err?.message || err);
+  idx = (idx + 1) % trackUrls.length;
+  setTimeout(loopPlay, 2000);
+});
 
 // ─── VOICE CONNECTION ─────────────────────────────────────────────────────────
+let connection = null;
 async function ensureConnection() {
   const channel = await client.channels.fetch(VOICE_CHANNEL_ID).catch(() => null);
-  if (!channel || channel.type !== 2) {
-    throw new Error('VOICE_CHANNEL_ID is not a voice channel I can access.');
-  }
+  if (!channel || channel.type !== 2) throw new Error('VOICE_CHANNEL_ID must be a voice channel I can access.');
 
   if (!connection) {
     connection = joinVoiceChannel({
@@ -250,53 +222,17 @@ async function ensureConnection() {
   }
 }
 
-// ─── PLAYBACK ─────────────────────────────────────────────────────────────────
-async function playCurrent() {
-  if (!playlistFiles.length) {
-    console.log('No local tracks found; retrying in 30s…');
-    setTimeout(loopPlay, 30000);
-    return;
-  }
-
-  const file = playlistFiles[playIndex % playlistFiles.length];
-  console.log(`▶️  Now Playing [${playIndex + 1}/${playlistFiles.length}]: ${path.basename(file)}`);
-
-  try {
-    const oggOut = ffmpegFileToOggOpus(file);
-    const resource = createAudioResource(oggOut, { inputType: StreamType.OggOpus });
-    player.play(resource);
-  } catch (err) {
-    console.error('Playback error:', err?.message || err);
-    playIndex = (playIndex + 1) % playlistFiles.length; // skip failed
-    setTimeout(loopPlay, 2000);
-  }
-}
-
-function loopPlay() {
-  playCurrent().catch(err => {
-    console.error('Loop error:', err?.message || err);
-    setTimeout(loopPlay, 5000);
-  });
-}
-
-player.on(AudioPlayerStatus.Idle, () => {
-  playIndex = (playIndex + 1) % playlistFiles.length;
-  setTimeout(loopPlay, 1500);
-});
-
-player.on('error', err => {
-  console.error('AudioPlayer error:', err?.message || err);
-  playIndex = (playIndex + 1) % playlistFiles.length;
-  setTimeout(loopPlay, 2000);
-});
-
-// ─── BOOT ─────────────────────────────────────────────────────────────────────
+// ─── BOOT ────────────────────────────────────────────────────────────────────
 async function main() {
   await sodium.ready;
   await client.login(DISCORD_TOKEN);
   console.log(`✅ Logged in as ${client.user.tag}`);
 
-  await downloadPlaylist();     // A1: only downloads missing tracks
+  // 1) Scrape playlist once
+  trackUrls = await scrapePlaylistTracks(SC_PLAYLIST_URL);
+  console.log(`✅ Playlist loaded (${trackUrls.length} tracks)`);
+
+  // 2) Join voice & start loop
   await ensureConnection();
   loopPlay();
 }
