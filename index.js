@@ -13,22 +13,23 @@ import {
   AudioPlayerStatus,
   entersState,
   VoiceConnectionStatus,
+  StreamType,
 } from "@discordjs/voice";
+import ffmpeg from "ffmpeg-static";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// ===== Env Vars (Railway) =====
+// ===== Env Vars =====
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const VOICE_CHANNEL_ID = process.env.VOICE_CHANNEL_ID;
 
-// Fail fast if required vars are missing
 if (!DISCORD_TOKEN || !VOICE_CHANNEL_ID) {
-  console.error("Missing env vars. Required: DISCORD_TOKEN, VOICE_CHANNEL_ID");
+  console.error("Missing DISCORD_TOKEN or VOICE_CHANNEL_ID env vars.");
   process.exit(1);
 }
 
-// ===== Load all .ogg files from the ROOT dir =====
+// ===== Playlist Loader =====
 function parseLeadingNumber(basename) {
   const m = basename.match(/^(\d+)\b/);
   return m ? parseInt(m[1], 10) : null;
@@ -37,11 +38,15 @@ function parseLeadingNumber(basename) {
 function loadPlaylist(dir) {
   const files = fs
     .readdirSync(dir)
-    .filter(f => f.toLowerCase().endsWith(".ogg"))
+    .filter(f =>
+      f.toLowerCase().endsWith(".ogg") ||
+      f.toLowerCase().endsWith(".mp3") ||
+      f.toLowerCase().endsWith(".wav")
+    )
     .map(f => ({ name: f, number: parseLeadingNumber(f) }));
 
   if (files.length === 0) {
-    throw new Error("No .ogg files found in repo root.");
+    throw new Error("No supported audio files (.ogg | .mp3 | .wav) in root.");
   }
 
   files.sort((a, b) => {
@@ -55,7 +60,7 @@ function loadPlaylist(dir) {
   return files.map(f => path.join(dir, f.name));
 }
 
-// ===== Discord Client =====
+// ===== Discord Bot Setup =====
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
 });
@@ -65,28 +70,24 @@ const player = createAudioPlayer();
 let playlist = [];
 let indexPtr = 0;
 
-// Play the next track in the loop
 function playNext() {
-  if (playlist.length === 0) return;
   const filePath = playlist[indexPtr];
-
   try {
-    const resource = createAudioResource(filePath);
+    const resource = createAudioResource(filePath, {
+      inputType: StreamType.Arbitrary,
+    });
     player.play(resource);
-
-    const base = path.basename(filePath);
-    console.log(`[PLAY] ${base} (${indexPtr + 1}/${playlist.length})`);
+    console.log(`[PLAY] ${path.basename(filePath)} (${indexPtr + 1}/${playlist.length})`);
   } catch (err) {
     console.error(`[ERROR] Failed to play ${filePath}:`, err);
   }
-
   indexPtr = (indexPtr + 1) % playlist.length;
 }
 
 async function connectAndSubscribe(channelId) {
   const channel = await client.channels.fetch(channelId);
-  if (!channel || channel.type !== 2) { // 2 = GuildVoice
-    throw new Error("VOICE_CHANNEL_ID must refer to a voice channel");
+  if (!channel || channel.type !== 2) {
+    throw new Error("VOICE_CHANNEL_ID must point to a Voice Channel.");
   }
 
   connection = joinVoiceChannel({
@@ -99,13 +100,13 @@ async function connectAndSubscribe(channelId) {
   connection.on(VoiceConnectionStatus.Disconnected, async () => {
     try {
       await Promise.race([
-        entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
-        entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
+        entersState(connection, VoiceConnectionStatus.Signalling, 5000),
+        entersState(connection, VoiceConnectionStatus.Connecting, 5000),
       ]);
       console.log("[VOICE] Reconnecting...");
     } catch {
-      console.warn("[VOICE] Recreate connection after disconnect...");
-      try { connection.destroy(); } catch {}
+      console.warn("[VOICE] Recreate connection...");
+      connection.destroy();
       await connectAndSubscribe(channelId);
     }
   });
@@ -114,25 +115,18 @@ async function connectAndSubscribe(channelId) {
 }
 
 player.on(AudioPlayerStatus.Idle, () => playNext());
-player.on("error", (err) => {
-  console.error("[PLAYER ERROR]", err.message);
+player.on("error", err => {
+  console.error("[PLAYER ERROR]", err);
   playNext();
 });
 
 client.once(Events.ClientReady, async () => {
-  try {
-    console.log(`[READY] Logged in as ${client.user.tag}`);
-
-    playlist = loadPlaylist(__dirname);
-    console.log(`[PLAYLIST] ${playlist.length} tracks loaded:`);
-    playlist.forEach((p, i) => console.log(`  ${String(i + 1).padStart(2)}. ${path.basename(p)}`));
-
-    await connectAndSubscribe(VOICE_CHANNEL_ID);
-    playNext();
-  } catch (err) {
-    console.error("[BOOT ERROR]", err);
-    process.exit(1);
-  }
+  console.log(`[READY] Logged in as ${client.user.tag}`);
+  playlist = loadPlaylist(__dirname);
+  console.log("[PLAYLIST]");
+  playlist.forEach((p, i) => console.log(`  ${String(i + 1).padStart(2)}. ${path.basename(p)}`));
+  await connectAndSubscribe(VOICE_CHANNEL_ID);
+  playNext();
 });
 
 client.login(DISCORD_TOKEN);
