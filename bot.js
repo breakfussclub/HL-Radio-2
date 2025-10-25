@@ -14,7 +14,7 @@ const play = require('play-dl');
 const { spawn } = require('node:child_process');
 const ffmpeg = require('ffmpeg-static');
 const sodium = require('libsodium-wrappers');
-const fetch = require('node-fetch');
+const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
 
 // ─── Env ──────────────────────────────────────────────────────────────────────
 const { DISCORD_TOKEN, VOICE_CHANNEL_ID, SC_PLAYLIST_URL } = process.env;
