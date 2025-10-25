@@ -14,6 +14,7 @@ import {
   entersState,
   VoiceConnectionStatus,
   StreamType,
+  NoSubscriberBehavior,
 } from "@discordjs/voice";
 import ffmpeg from "ffmpeg-static";
 
@@ -79,12 +80,18 @@ const client = new Client({
 });
 
 let connection = null;
-const player = createAudioPlayer();
+const player = createAudioPlayer({
+  behaviors: {
+    noSubscriber: NoSubscriberBehavior.Play // prevents disconnect
+  }
+});
+
 let playlist = [];
 let indexPtr = 0;
 let hasStartedPlayback = false;
+let keepAliveInterval = null;
 
-// ===== Playback =====
+// ===== Play Next Track =====
 function playNext() {
   const filePath = playlist[indexPtr];
   const baseName = path.basename(filePath);
@@ -104,6 +111,23 @@ function playNext() {
   indexPtr = (indexPtr + 1) % playlist.length;
 }
 
+// ===== Silent Opus Keep-Alive (prevents disconnects while paused) =====
+function startKeepAlive(connection) {
+  stopKeepAlive();
+  keepAliveInterval = setInterval(() => {
+    try {
+      connection?.configureNetworking();
+    } catch {}
+  }, 15000); // every 15s
+}
+
+function stopKeepAlive() {
+  if (keepAliveInterval) {
+    clearInterval(keepAliveInterval);
+    keepAliveInterval = null;
+  }
+}
+
 // ===== Voice Connection =====
 async function connectAndSubscribe(channelId) {
   const channel = await client.channels.fetch(channelId);
@@ -118,24 +142,11 @@ async function connectAndSubscribe(channelId) {
     selfDeaf: true,
   });
 
-  connection.on(VoiceConnectionStatus.Disconnected, async () => {
-    try {
-      await Promise.race([
-        entersState(connection, VoiceConnectionStatus.Signalling, 5000),
-        entersState(connection, VoiceConnectionStatus.Connecting, 5000),
-      ]);
-      console.log("[VOICE] Reconnecting...");
-    } catch {
-      console.warn("[VOICE] Recreate connection...");
-      connection.destroy();
-      await connectAndSubscribe(channelId);
-    }
-  });
-
+  startKeepAlive(connection);
   connection.subscribe(player);
 }
 
-// ===== Auto Pause / Resume + Wait for First Listener =====
+// ===== Auto-Pause / Resume + Wait for First Listener =====
 client.on("voiceStateUpdate", (oldState, newState) => {
   const channel = oldState.channel || newState.channel;
   if (!channel || channel.id !== VOICE_CHANNEL_ID) return;
