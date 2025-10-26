@@ -1,3 +1,5 @@
+// index.js — Local playlist bot with reliable resume/restart (ffmpeg-seek) and 300s threshold
+
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -16,6 +18,7 @@ import {
   StreamType,
   NoSubscriberBehavior,
 } from "@discordjs/voice";
+import { spawn } from "node:child_process";
 import ffmpeg from "ffmpeg-static";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -28,6 +31,21 @@ const VOICE_CHANNEL_ID = process.env.VOICE_CHANNEL_ID;
 if (!DISCORD_TOKEN || !VOICE_CHANNEL_ID) {
   console.error("Missing DISCORD_TOKEN or VOICE_CHANNEL_ID env vars.");
   process.exit(1);
+}
+
+// ===== Config =====
+const RESUME_RESTART_THRESHOLD_MS = 300 * 1000; // 300s = 5 minutes
+const OPUS_BITRATE = "96k";
+const OPUS_CHANNELS = "2";
+const OPUS_APP = "audio";
+
+// ===== Small helpers =====
+function hms(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  return (h ? `${h}:` : "") + `${m.toString().padStart(2, "0")}:${sec.toString().padStart(2, "0")}`;
 }
 
 // ===== Playlist Loader =====
@@ -68,7 +86,7 @@ function setListeningStatus(trackName) {
   clean = clean.replace(/-of$/i, "");                  // remove -of at end
   clean = clean.replace(/[-_]/g, " ");                 // replace symbols with space
   clean = clean.replace(/\b\w/g, c => c.toUpperCase()); // capitalize words
-  client.user.setActivity(clean, { type: 2 });         // type 2 = LISTENING
+  try { client.user.setActivity(clean, { type: 2 }); } catch {}
 }
 
 // ===== Discord Bot Setup =====
@@ -91,16 +109,58 @@ let indexPtr = 0;
 let hasStartedPlayback = false;
 let keepAliveInterval = null;
 
-// ===== Play Next Track =====
+// Resume state
+let isPausedDueToEmpty = false;
+let resumeOffsetMs = 0;
+let startedAtMs = 0;
+let currentTrackPath = null;
+let ffmpegProc = null; // only non-null when we are playing via ffmpeg (resume/restart path)
+
+// ===== ffmpeg play helper (for resume/restart with precise seek) =====
+function playFromOffset(filePath, offsetMs = 0) {
+  // Clean up any previous ffmpeg
+  try { ffmpegProc?.kill("SIGKILL"); } catch {}
+  ffmpegProc = null;
+
+  const args = [
+    "-hide_banner",
+    "-loglevel", "error",
+    "-ss", Math.floor(offsetMs / 1000).toString(),
+    "-i", filePath,
+    "-vn",
+    "-ac", OPUS_CHANNELS,
+    "-ar", "48000",
+    "-c:a", "libopus",
+    "-b:a", OPUS_BITRATE,
+    "-application", OPUS_APP,
+    "-f", "ogg",
+    "pipe:1",
+  ];
+
+  ffmpegProc = spawn(ffmpeg, args, { stdio: ["ignore", "pipe", "pipe"] });
+  ffmpegProc.stderr?.on("data", () => {}); // keep stderr drained quietly
+
+  const resource = createAudioResource(ffmpegProc.stdout, { inputType: StreamType.OggOpus });
+  player.play(resource);
+  startedAtMs = Date.now();
+}
+
+// ===== Play Next Track (normal path) =====
 function playNext() {
-  const filePath = playlist[indexPtr];
-  const baseName = path.basename(filePath);
+  // If we were in an ffmpeg session, stop it before moving to next track
+  try { ffmpegProc?.kill("SIGKILL"); } catch {}
+  ffmpegProc = null;
+
+  currentTrackPath = playlist[indexPtr];
+  const baseName = path.basename(currentTrackPath);
 
   try {
-    const resource = createAudioResource(filePath, {
+    const resource = createAudioResource(currentTrackPath, {
       inputType: StreamType.Arbitrary
     });
 
+    resumeOffsetMs = 0;
+    startedAtMs = Date.now();
     player.play(resource);
     setListeningStatus(baseName);
     console.log(`[PLAY] ${baseName} (${indexPtr + 1}/${playlist.length})`);
@@ -115,9 +175,7 @@ function playNext() {
 function startKeepAlive(connection) {
   stopKeepAlive();
   keepAliveInterval = setInterval(() => {
-    try {
-      connection?.configureNetworking();
-    } catch {}
+    try { connection?.configureNetworking(); } catch {}
   }, 15000); // every 15s
 }
 
@@ -142,6 +200,23 @@ async function connectAndSubscribe(channelId) {
     selfDeaf: true,
   });
 
+  // Auto-reconnect handler
+  connection.on(VoiceConnectionStatus.Disconnected, async () => {
+    console.warn("[VC] Disconnected — attempting quick recovery…");
+    try {
+      await Promise.race([
+        entersState(connection, VoiceConnectionStatus.Signalling, 5000),
+        entersState(connection, VoiceConnectionStatus.Connecting, 5000),
+      ]);
+    } catch {
+      setTimeout(() => {
+        try { connection?.destroy(); } catch {}
+        connection = null;
+        connectAndSubscribe(channelId).catch(() => {});
+      }, 3000);
+    }
+  });
+
   startKeepAlive(connection);
   connection.subscribe(player);
 }
@@ -153,16 +228,25 @@ client.on("voiceStateUpdate", (oldState, newState) => {
 
   const humanMembers = channel.members.filter(m => !m.user.bot);
 
-  // If empty, pause ONLY if currently playing
   if (humanMembers.size === 0) {
+    // Pause & capture progress only if currently playing
     if (player.state.status === AudioPlayerStatus.Playing) {
-      player.pause();
-      console.log("[VC] No listeners — pausing playback.");
+      const elapsed = Math.max(0, Date.now() - (startedAtMs || Date.now()));
+      resumeOffsetMs += elapsed;
+
+      isPausedDueToEmpty = true;
+
+      // Stop the player; if ffmpeg is active, kill it to avoid stale pipes
+      try { player.pause(); } catch {}
+      try { ffmpegProc?.kill("SIGKILL"); } catch {}
+      ffmpegProc = null;
+
+      console.log(`[VC] No listeners — paused @ ${hms(resumeOffsetMs)}.`);
     }
     return;
   }
 
-  // If someone joined and we haven't started yet, start playback
+  // First listener ever since boot
   if (!hasStartedPlayback) {
     hasStartedPlayback = true;
     console.log("[VC] First listener joined — starting playback.");
@@ -170,20 +254,71 @@ client.on("voiceStateUpdate", (oldState, newState) => {
     return;
   }
 
-  // If paused, resume playback
+  // Resume logic with threshold:
+  // - If under 5m, resume current track from offset using ffmpeg seek
+  // - If 5m or more, restart current track from beginning using ffmpeg
+  const overThreshold = resumeOffsetMs >= RESUME_RESTART_THRESHOLD_MS;
+
+  if (isPausedDueToEmpty) {
+    if (!currentTrackPath) {
+      // Fallback: if for some reason we have no track cached, just play next
+      console.log("[VC] Listener returned — no current track cached, moving to next.");
+      isPausedDueToEmpty = false;
+      playNext();
+      return;
+    }
+
+    if (overThreshold) {
+      console.log(`🔁 Returning listener — track played ${hms(resumeOffsetMs)}, above threshold, restarting from beginning.`);
+      isPausedDueToEmpty = false;
+      resumeOffsetMs = 0;
+      playFromOffset(currentTrackPath, 0);
+    } else {
+      console.log(`▶️  Listener returned — resuming from ${hms(resumeOffsetMs)} (under threshold).`);
+      isPausedDueToEmpty = false;
+      playFromOffset(currentTrackPath, resumeOffsetMs);
+    }
+    return;
+  }
+
+  // Safety: if somehow paused without flag, treat the same way
   if (player.state.status === AudioPlayerStatus.Paused) {
-    player.unpause();
-    console.log("[VC] Listener joined — resuming playback.");
+    if (!currentTrackPath) {
+      console.log("[VC] Listener returned — no current track cached, moving to next.");
+      playNext();
+      return;
+    }
+    if (overThreshold) {
+      console.log(`🔁 Returning listener — track played ${hms(resumeOffsetMs)}, above threshold, restarting from beginning.`);
+      resumeOffsetMs = 0;
+      playFromOffset(currentTrackPath, 0);
+    } else {
+      console.log(`▶️  Listener returned — resuming from ${hms(resumeOffsetMs)} (under threshold).`);
+      playFromOffset(currentTrackPath, resumeOffsetMs);
+    }
   }
 });
 
 // ===== Event Hooks =====
 player.on(AudioPlayerStatus.Idle, () => {
-  if (hasStartedPlayback) playNext();
+  // Track finished — continue playlist normally
+  if (hasStartedPlayback) {
+    resumeOffsetMs = 0;
+    startedAtMs = 0;
+    currentTrackPath = null;
+    playNext();
+  }
 });
+
 player.on("error", err => {
   console.error("[PLAYER ERROR]", err);
-  if (hasStartedPlayback) playNext();
+  if (hasStartedPlayback) {
+    // On error, advance to next track
+    resumeOffsetMs = 0;
+    startedAtMs = 0;
+    currentTrackPath = null;
+    playNext();
+  }
 });
 
 // ===== On Ready =====
@@ -192,7 +327,7 @@ client.once(Events.ClientReady, async () => {
 
   playlist = loadPlaylist(__dirname);
   console.log("[PLAYLIST]");
-  playlist.forEach((p, i) => console.log(`  ${String(i + 1).padStart(2)}. ${path.basename(p)}`));
+  playlist.forEach((p, i) => console.log(`  ${String(i + 1).padStart(2, "0")}. ${path.basename(p)}`));
 
   await connectAndSubscribe(VOICE_CHANNEL_ID);
   console.log("[VC] Waiting for listeners...");
