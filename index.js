@@ -1,3 +1,11 @@
+// index.js — Local playlist bot with robust resume/restart (ffmpeg-only) + 300s threshold
+// - Always spawn ffmpeg (even for fresh plays) -> consistent Ogg Opus stream
+// - On resume/restart/next: kill old ffmpeg, spawn new one, create fresh resource, player.play(...)
+// - Startup watchdog: if ffmpeg doesn't produce audio, skip to next track
+// - Loop mode: continue
+// - Resume threshold: 300s (resume below, restart at/above)
+// - No unpause() usage
+
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -36,6 +44,7 @@ const RESUME_RESTART_THRESHOLD_MS = 300 * 1000; // 300s = 5 minutes
 const OPUS_BITRATE = "96k";
 const OPUS_CHANNELS = "2";
 const OPUS_APP = "audio";
+const STARTUP_WATCHDOG_MS = 15000; // fail fast if no audio
 
 function hms(ms) {
   const s = Math.max(0, Math.floor(ms / 1000));
@@ -57,12 +66,14 @@ function loadPlaylist(dir) {
     .filter(f =>
       f.toLowerCase().endsWith(".ogg") ||
       f.toLowerCase().endsWith(".mp3") ||
-      f.toLowerCase().endsWith(".wav")
+      f.toLowerCase().endsWith(".wav") ||
+      f.toLowerCase().endsWith(".m4a") ||
+      f.toLowerCase().endsWith(".flac")
     )
     .map(f => ({ name: f, number: parseLeadingNumber(f) }));
 
   if (!files.length) {
-    throw new Error("No supported audio files (.ogg | .mp3 | .wav) in repo root.");
+    throw new Error("No supported audio files (.ogg | .mp3 | .wav | .m4a | .flac) in repo root.");
   }
 
   files.sort((a, b) => {
@@ -82,6 +93,7 @@ function setListeningStatus(trackName) {
   clean = clean.replace(/^\d+\s*/, "");
   clean = clean.replace(/-of$/i, "");
   clean = clean.replace(/[-_]/g, " ");
+  clean = clean.replace(/\s+/g, " ").trim();
   clean = clean.replace(/\b\w/g, c => c.toUpperCase());
   try { client.user.setActivity(clean, { type: 2 }); } catch {}
 }
@@ -112,16 +124,24 @@ let resumeOffsetMs = 0;
 let startedAtMs = 0;
 let currentTrackPath = null;
 let ffmpegProc = null;
+let startupWatchdog = null;
 
-// ===== ffmpeg play helper =====
-function playFromOffset(filePath, offsetMs = 0) {
+// ===== ffmpeg helpers =====
+function killFfmpeg() {
   try { ffmpegProc?.kill("SIGKILL"); } catch {}
   ffmpegProc = null;
+  if (startupWatchdog) {
+    clearTimeout(startupWatchdog);
+    startupWatchdog = null;
+  }
+}
 
+function spawnFfmpeg(filePath, offsetMs = 0) {
+  // Always transcode to Ogg Opus for Discord
   const args = [
     "-hide_banner",
     "-loglevel", "error",
-    "-ss", Math.floor(offsetMs / 1000).toString(),
+    ...(offsetMs > 0 ? ["-ss", Math.floor(offsetMs / 1000).toString()] : []),
     "-i", filePath,
     "-vn",
     "-ac", OPUS_CHANNELS,
@@ -133,36 +153,70 @@ function playFromOffset(filePath, offsetMs = 0) {
     "pipe:1",
   ];
 
+  killFfmpeg(); // ensure clean state
   ffmpegProc = spawn(ffmpeg, args, { stdio: ["ignore", "pipe", "pipe"] });
-  ffmpegProc.stderr?.on("data", () => {});
 
-  const resource = createAudioResource(ffmpegProc.stdout, { inputType: StreamType.OggOpus });
-  player.play(resource);
-  startedAtMs = Date.now();
+  // Swallow stderr to avoid noisy logs; useful if files have meta/icc chatter
+  ffmpegProc.stderr?.on("data", () => {});
+  ffmpegProc.on("exit", (code, signal) => {
+    if (startupWatchdog) {
+      clearTimeout(startupWatchdog);
+      startupWatchdog = null;
+    }
+    // Normal end is handled by AudioPlayerStatus.Idle; nothing to do here
+  });
+
+  return ffmpegProc.stdout;
 }
 
-// ===== Play Next Track =====
-function playNext() {
-  try { ffmpegProc?.kill("SIGKILL"); } catch {}
-  ffmpegProc = null;
+function playWithFfmpeg(filePath, offsetMs = 0) {
+  currentTrackPath = filePath;
+  const baseName = path.basename(filePath);
+  setListeningStatus(baseName);
 
-  currentTrackPath = playlist[indexPtr];
-  const baseName = path.basename(currentTrackPath);
+  const stdout = spawnFfmpeg(filePath, offsetMs);
 
-  try {
-    const resource = createAudioResource(currentTrackPath, {
-      inputType: StreamType.Arbitrary
-    });
-
-    resumeOffsetMs = 0;
+  // Watchdog: if ffmpeg doesn't push any bytes soon, skip to next
+  let gotData = false;
+  const onFirstData = () => {
+    gotData = true;
+    if (startupWatchdog) {
+      clearTimeout(startupWatchdog);
+      startupWatchdog = null;
+    }
     startedAtMs = Date.now();
-    player.play(resource);
-    setListeningStatus(baseName);
-    console.log(`[PLAY] ${baseName} (${indexPtr + 1}/${playlist.length})`);
-  } catch (err) {
-    console.error(`[ERROR] Failed to play ${baseName}:`, err);
-  }
+  };
+  stdout.once("data", onFirstData);
 
+  startupWatchdog = setTimeout(() => {
+    if (!gotData) {
+      console.warn(`[WATCHDOG] No audio from ffmpeg — skipping: ${baseName}`);
+      killFfmpeg();
+      // Move pointer forward only for fresh plays (not resumes) — but both cases land here after playWithFfmpeg call
+      // We'll emulate "track failed" -> advance
+      resumeOffsetMs = 0;
+      startedAtMs = 0;
+      currentTrackPath = null;
+      playNext();
+    }
+  }, STARTUP_WATCHDOG_MS);
+
+  const resource = createAudioResource(stdout, { inputType: StreamType.OggOpus });
+  player.play(resource);
+}
+
+// ===== Play Next Track (uses ffmpeg, offset 0) =====
+function playNext() {
+  const filePath = playlist[indexPtr];
+  const baseName = path.basename(filePath);
+
+  console.log(`[PLAY] ${baseName} (${indexPtr + 1}/${playlist.length})`);
+  resumeOffsetMs = 0;
+  startedAtMs = 0;
+
+  playWithFfmpeg(filePath, 0);
+
+  // Advance pointer for loop-continuation
   indexPtr = (indexPtr + 1) % playlist.length;
 }
 
@@ -215,7 +269,7 @@ async function connectAndSubscribe(channelId) {
   connection.subscribe(player);
 }
 
-// ===== Auto-Pause / Resume + First Listener =====
+// ===== Auto-Pause / Resume + First Listener (ffmpeg-only) =====
 client.on("voiceStateUpdate", (oldState, newState) => {
   const channel = oldState.channel || newState.channel;
   if (!channel || channel.id !== VOICE_CHANNEL_ID) return;
@@ -224,12 +278,14 @@ client.on("voiceStateUpdate", (oldState, newState) => {
 
   if (humans.size === 0) {
     if (player.state.status === AudioPlayerStatus.Playing) {
+      // Calculate elapsed and remember offset; stop audio pipeline completely
       const elapsed = Math.max(0, Date.now() - (startedAtMs || Date.now()));
       resumeOffsetMs += elapsed;
       isPausedDueToEmpty = true;
-      try { player.pause(); } catch {}
-      try { ffmpegProc?.kill("SIGKILL"); } catch {}
-      ffmpegProc = null;
+
+      try { player.stop(true); } catch {}
+      killFfmpeg();
+
       console.log(`[VC] No listeners — paused @ ${hms(resumeOffsetMs)}.`);
     }
     return;
@@ -245,61 +301,47 @@ client.on("voiceStateUpdate", (oldState, newState) => {
   const overThreshold = resumeOffsetMs >= RESUME_RESTART_THRESHOLD_MS;
 
   if (isPausedDueToEmpty) {
-    if (!currentTrackPath) {
-      console.log("[VC] Listener returned — no current track cached, moving to next.");
-      isPausedDueToEmpty = false;
-      playNext();
-      return;
-    }
+    // Always rebuild pipeline via ffmpeg on resume
+    const targetOffset = overThreshold ? 0 : resumeOffsetMs;
+    console.log(
+      overThreshold
+        ? `🔁 Returning listener — restarting from beginning (≥ ${hms(RESUME_RESTART_THRESHOLD_MS)}).`
+        : `▶️  Returning listener — resuming from ${hms(resumeOffsetMs)}.`
+    );
 
-    if (overThreshold) {
-      console.log(`🔁 Returning listener — track played ${hms(resumeOffsetMs)}, above threshold, restarting from beginning.`);
-      isPausedDueToEmpty = false;
-      resumeOffsetMs = 0;
-      playFromOffset(currentTrackPath, 0);
-    } else {
-      console.log(`▶️  Listener returned — resuming from ${hms(resumeOffsetMs)} (under threshold).`);
-      isPausedDueToEmpty = false;
-      playFromOffset(currentTrackPath, resumeOffsetMs);
-    }
-    return;
-  }
+    isPausedDueToEmpty = false;
 
-  if (player.state.status === AudioPlayerStatus.Paused) {
     if (!currentTrackPath) {
-      console.log("[VC] Listener returned — no current track cached, moving to next.");
+      // Shouldn't happen normally, but guard: if we lost track, continue to next
       playNext();
-      return;
-    }
-    if (overThreshold) {
-      console.log(`🔁 Returning listener — track played ${hms(resumeOffsetMs)}, above threshold, restarting from beginning.`);
-      resumeOffsetMs = 0;
-      playFromOffset(currentTrackPath, 0);
     } else {
-      console.log(`▶️  Listener returned — resuming from ${hms(resumeOffsetMs)} (under threshold).`);
-      playFromOffset(currentTrackPath, resumeOffsetMs);
+      playWithFfmpeg(currentTrackPath, targetOffset);
     }
   }
 });
 
 // ===== Events =====
+player.on(AudioPlayerStatus.Playing, () => {
+  // Fresh resource started
+  // startedAtMs is set in playWithFfmpeg on first data
+});
+
 player.on(AudioPlayerStatus.Idle, () => {
-  if (hasStartedPlayback) {
-    resumeOffsetMs = 0;
-    startedAtMs = 0;
-    currentTrackPath = null;
-    playNext();
-  }
+  // End of current resource; advance unless paused due to empty (we kill pipeline then)
+  if (isPausedDueToEmpty) return;
+  resumeOffsetMs = 0;
+  startedAtMs = 0;
+  currentTrackPath = null;
+  playNext();
 });
 
 player.on("error", err => {
   console.error("[PLAYER ERROR]", err);
-  if (hasStartedPlayback) {
-    resumeOffsetMs = 0;
-    startedAtMs = 0;
-    currentTrackPath = null;
-    playNext();
-  }
+  // On errors: advance to next
+  resumeOffsetMs = 0;
+  startedAtMs = 0;
+  currentTrackPath = null;
+  playNext();
 });
 
 // ===== On Ready =====
